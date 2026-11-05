@@ -35,6 +35,8 @@ internal sealed class PanelWindow : Window
     private readonly string settings = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RdpSwitch", "position.json");
     private string signature = "";
     private Point? dragStart;
+    private Point windowStart;
+    private IntPtr pressedWindow;
     private bool dragged;
     private IntPtr handle;
 
@@ -79,21 +81,62 @@ internal sealed class PanelWindow : Window
             Refresh(); timer.Start();
         };
         timer.Tick += (_, _) => Refresh();
-        PreviewMouseLeftButtonDown += (_, e) => { dragStart = e.GetPosition(this); dragged = false; };
+        PreviewMouseLeftButtonDown += (_, e) =>
+        {
+            if (e.OriginalSource is DependencyObject source)
+                for (var element = source; element != null; element = VisualTreeHelper.GetParent(element))
+                    if (element is System.Windows.Controls.Primitives.ScrollBar) return;
+            pressedWindow = IntPtr.Zero;
+            if (e.OriginalSource is DependencyObject target)
+                for (var element = target; element != null; element = VisualTreeHelper.GetParent(element))
+                    if (element is Button { Tag: IntPtr h }) { pressedWindow = h; break; }
+            dragStart = PointToScreen(e.GetPosition(this));
+            Native.GetWindowRect(handle, out var rect);
+            windowStart = new Point(rect.Left, rect.Top);
+            dragged = false;
+            CaptureMouse();
+            e.Handled = true;
+        };
         PreviewMouseMove += (_, e) =>
         {
             if (dragStart is not Point start || e.LeftButton != MouseButtonState.Pressed) return;
-            var p = e.GetPosition(this);
-            if (Math.Abs(p.X - start.X) + Math.Abs(p.Y - start.Y) < 5) return;
-            dragged = true; dragStart = null;
-            try { DragMove(); } catch (InvalidOperationException) { }
+            var p = PointToScreen(e.GetPosition(this));
+            if (!dragged && Math.Abs(p.X - start.X) < SystemParameters.MinimumHorizontalDragDistance && Math.Abs(p.Y - start.Y) < SystemParameters.MinimumVerticalDragDistance) return;
+            dragged = true;
+            Native.SetWindowPos(handle, IntPtr.Zero, (int)(windowStart.X + p.X - start.X), (int)(windowStart.Y + p.Y - start.Y), 0, 0, 0x0015);
+            e.Handled = true;
         };
+        PreviewMouseLeftButtonUp += (_, e) =>
+        {
+            if (dragStart == null) return;
+            var target = pressedWindow;
+            var wasDragged = dragged;
+            dragStart = null; pressedWindow = IntPtr.Zero;
+            ReleaseMouseCapture();
+            e.Handled = true;
+            if (wasDragged) SavePosition();
+            else ActivateConnection(target);
+        };
+        LostMouseCapture += (_, _) => { dragStart = null; pressedWindow = IntPtr.Zero; };
         Closed += (_, _) =>
         {
             timer.Stop(); tray.Dispose(); trayIcon.Dispose();
-            try { Directory.CreateDirectory(Path.GetDirectoryName(settings)!); File.WriteAllText(settings, JsonSerializer.Serialize(new[] { Left, Top })); }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            SavePosition();
         };
+    }
+
+    private void SavePosition()
+    {
+        try { Directory.CreateDirectory(Path.GetDirectoryName(settings)!); File.WriteAllText(settings, JsonSerializer.Serialize(new[] { Left, Top })); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+    }
+
+    private void ActivateConnection(IntPtr target)
+    {
+        if (!Native.IsWindow(target)) return;
+        if (Native.IsIconic(target)) Native.ShowWindowAsync(target, 9);
+        Native.SetForegroundWindow(target);
+        Refresh();
     }
 
     private static System.Drawing.Icon CreateTrayIcon()
@@ -125,6 +168,7 @@ internal sealed class PanelWindow : Window
 
     private void Refresh()
     {
+        if (dragStart != null) return;
         var windows = new List<(IntPtr Handle, string Name)>();
         Native.EnumWindows((h, _) =>
         {
@@ -158,17 +202,14 @@ internal sealed class PanelWindow : Window
         {
             var button = new Button
             {
+                Tag = window.Handle,
                 Content = ConnectionLabel(window.Name, windowOrder.IndexOf(window.Handle) + 1), ToolTip = window.Name + "\nНажмите для переключения. Потяните для перемещения панели.",
                 Foreground = Brushes.White, Background = new SolidColorBrush(window.Handle == active ? Color.FromRgb(48, 104, 170) : Color.FromRgb(43, 47, 57)),
                 BorderThickness = new Thickness(0), Padding = new Thickness(12, 5, 12, 5), Margin = new Thickness(2, 0, 2, 0), FontSize = 12, Focusable = false
             };
             button.Click += (_, _) =>
             {
-                if (dragged) { dragged = false; return; }
-                if (!Native.IsWindow(window.Handle)) return;
-                if (Native.IsIconic(window.Handle)) Native.ShowWindowAsync(window.Handle, 9);
-                Native.SetForegroundWindow(window.Handle);
-                Refresh();
+                ActivateConnection(window.Handle);
             };
             row.Children.Add(button);
         }
@@ -177,6 +218,9 @@ internal sealed class PanelWindow : Window
 
 internal static class Native
 {
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct Rect { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll")] internal static extern bool GetWindowRect(IntPtr h, out Rect rect);
     [DllImport("user32.dll")] internal static extern bool DestroyIcon(IntPtr icon);
     internal delegate bool EnumProc(IntPtr hwnd, IntPtr param);
     [DllImport("user32.dll")] internal static extern bool EnumWindows(EnumProc callback, IntPtr param);
