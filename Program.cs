@@ -51,7 +51,27 @@ internal sealed class PanelWindow : Window
         ShowActivated = false;
         Background = new SolidColorBrush(Color.FromRgb(29, 32, 39));
         Left = 80; Top = 10;
-        Content = new Border { Padding = new Thickness(4), BorderBrush = new SolidColorBrush(Color.FromRgb(65, 70, 81)), BorderThickness = new Thickness(1), Child = new ScrollViewer { Content = row, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, VerticalScrollBarVisibility = ScrollBarVisibility.Disabled, MaxWidth = Math.Max(200, SystemParameters.WorkArea.Width - 30) } };
+        var desktopButton = new Button
+        {
+            Tag = "desktop",
+            Content = new System.Windows.Shapes.Path
+            {
+                Data = Geometry.Parse("M1,1 L17,1 L17,12 L1,12 Z M9,12 L9,16 M5,16 L13,16"),
+                Stroke = Brushes.White, StrokeThickness = 1.4, Width = 18, Height = 18,
+                Stretch = Stretch.Uniform
+            },
+            ToolTip = "Показать рабочий стол — свернуть только RDP",
+            Background = new SolidColorBrush(Color.FromRgb(43, 47, 57)),
+            BorderThickness = new Thickness(0), Padding = new Thickness(9, 4, 9, 4),
+            Margin = new Thickness(5, 0, 0, 0), Focusable = false
+        };
+        System.Windows.Automation.AutomationProperties.SetName(desktopButton, "Свернуть все RDP");
+        desktopButton.Click += (_, _) => MinimizeConnections();
+        var layout = new DockPanel { LastChildFill = true };
+        DockPanel.SetDock(desktopButton, Dock.Right);
+        layout.Children.Add(desktopButton);
+        layout.Children.Add(new ScrollViewer { Content = row, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, VerticalScrollBarVisibility = ScrollBarVisibility.Disabled, MaxWidth = Math.Max(200, SystemParameters.WorkArea.Width - 75) });
+        Content = new Border { Padding = new Thickness(4), BorderBrush = new SolidColorBrush(Color.FromRgb(65, 70, 81)), BorderThickness = new Thickness(1), Child = layout };
         var menu = new ContextMenu();
         var exit = new MenuItem { Header = "Выход" };
         exit.Click += (_, _) => Close();
@@ -85,7 +105,7 @@ internal sealed class PanelWindow : Window
         {
             if (e.OriginalSource is DependencyObject source)
                 for (var element = source; element != null; element = VisualTreeHelper.GetParent(element))
-                    if (element is System.Windows.Controls.Primitives.ScrollBar) return;
+                    if (element is System.Windows.Controls.Primitives.ScrollBar || element is Button { Tag: "desktop" }) return;
             pressedWindow = IntPtr.Zero;
             if (e.OriginalSource is DependencyObject target)
                 for (var element = target; element != null; element = VisualTreeHelper.GetParent(element))
@@ -137,6 +157,23 @@ internal sealed class PanelWindow : Window
         if (Native.IsIconic(target)) Native.ShowWindowAsync(target, 9);
         Native.SetForegroundWindow(target);
         Refresh();
+    }
+
+    private void MinimizeConnections()
+    {
+        Refresh();
+        foreach (var target in windowOrder.ToArray())
+        {
+            if (!Native.IsWindow(target) || Native.IsIconic(target)) continue;
+            Native.GetWindowThreadProcessId(target, out var pid);
+            try
+            {
+                using var process = Process.GetProcessById((int)pid);
+                if (process.ProcessName.Equals("mstsc", StringComparison.OrdinalIgnoreCase))
+                    Native.ShowWindowAsync(target, 6); // SW_MINIMIZE
+            }
+            catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { }
+        }
     }
 
     private static System.Drawing.Icon CreateTrayIcon()
