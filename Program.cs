@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Text.Json.Serialization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -27,6 +28,21 @@ internal static class Program
 
 internal sealed class PanelWindow : Window
 {
+    public sealed class Connection
+    {
+        public string Name { get; set; } = "";
+        public string Target { get; set; } = "";
+        [JsonIgnore] public IntPtr Handle { get; set; }
+    }
+    private readonly List<Connection> connections = new();
+    public sealed class Preferences
+    {
+        public bool MinimizeOtherRdpOnSwitch { get; set; } = true;
+    }
+    private Preferences preferences = new();
+    private Window? settingsWindow;
+    private bool prompting;
+    private int openMenus;
     private readonly StackPanel row = new() { Orientation = Orientation.Horizontal };
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromMilliseconds(700) };
     private readonly Forms.NotifyIcon tray;
@@ -36,7 +52,7 @@ internal sealed class PanelWindow : Window
     private string signature = "";
     private Point? dragStart;
     private Point windowStart;
-    private IntPtr pressedWindow;
+    private Connection? pressedConnection;
     private bool dragged;
     private IntPtr handle;
 
@@ -72,14 +88,17 @@ internal sealed class PanelWindow : Window
         layout.Children.Add(desktopButton);
         layout.Children.Add(new ScrollViewer { Content = row, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, VerticalScrollBarVisibility = ScrollBarVisibility.Disabled, MaxWidth = Math.Max(200, SystemParameters.WorkArea.Width - 75) });
         Content = new Border { Padding = new Thickness(4), BorderBrush = new SolidColorBrush(Color.FromRgb(65, 70, 81)), BorderThickness = new Thickness(1), Child = layout };
-        var menu = new ContextMenu();
+        var menu = CreatePanelMenu();
         var exit = new MenuItem { Header = "Выход" };
         exit.Click += (_, _) => Close();
         menu.Items.Add(exit); ContextMenu = menu;
         trayIcon = CreateTrayIcon();
         tray = new Forms.NotifyIcon { Icon = trayIcon, Text = "RdpSwitch — переключатель подключений", Visible = true };
         var trayMenu = new Forms.ContextMenuStrip();
+        trayMenu.Opened += (_, _) => openMenus++;
+        trayMenu.Closed += (_, _) => { openMenus = Math.Max(0, openMenus - 1); };
         trayMenu.Items.Add("Вернуть панель", null, (_, _) => { Left = 80; Top = 10; Refresh(); });
+        trayMenu.Items.Add("Настройки", null, (_, _) => ShowSettings());
         trayMenu.Items.Add("Выход", null, (_, _) => Close());
         tray.ContextMenuStrip = trayMenu;
         try
@@ -94,6 +113,17 @@ internal sealed class PanelWindow : Window
                 }
         }
         catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { }
+        try
+        {
+            preferences = JsonSerializer.Deserialize<Preferences>(File.ReadAllText(Path.Combine(Path.GetDirectoryName(settings)!, "settings.json"))) ?? new();
+        }
+        catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { }
+        try
+        {
+            var saved = JsonSerializer.Deserialize<List<Connection>>(File.ReadAllText(Path.Combine(Path.GetDirectoryName(settings)!, "connections.json")));
+            if (saved != null) connections.AddRange(saved.FindAll(c => c != null && !string.IsNullOrWhiteSpace(c.Name)));
+        }
+        catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { }
         SourceInitialized += (_, _) =>
         {
             handle = new WindowInteropHelper(this).Handle;
@@ -106,10 +136,10 @@ internal sealed class PanelWindow : Window
             if (e.OriginalSource is DependencyObject source)
                 for (var element = source; element != null; element = VisualTreeHelper.GetParent(element))
                     if (element is System.Windows.Controls.Primitives.ScrollBar || element is Button { Tag: "desktop" }) return;
-            pressedWindow = IntPtr.Zero;
+            pressedConnection = null;
             if (e.OriginalSource is DependencyObject target)
                 for (var element = target; element != null; element = VisualTreeHelper.GetParent(element))
-                    if (element is Button { Tag: IntPtr h }) { pressedWindow = h; break; }
+                    if (element is Button { Tag: Connection connection }) { pressedConnection = connection; break; }
             dragStart = PointToScreen(e.GetPosition(this));
             Native.GetWindowRect(handle, out var rect);
             windowStart = new Point(rect.Left, rect.Top);
@@ -129,15 +159,15 @@ internal sealed class PanelWindow : Window
         PreviewMouseLeftButtonUp += (_, e) =>
         {
             if (dragStart == null) return;
-            var target = pressedWindow;
+            var target = pressedConnection;
             var wasDragged = dragged;
-            dragStart = null; pressedWindow = IntPtr.Zero;
+            dragStart = null; pressedConnection = null;
             ReleaseMouseCapture();
             e.Handled = true;
             if (wasDragged) SavePosition();
-            else ActivateConnection(target);
+            else if (target != null) ActivateConnection(target.Handle);
         };
-        LostMouseCapture += (_, _) => { dragStart = null; pressedWindow = IntPtr.Zero; };
+        LostMouseCapture += (_, _) => { dragStart = null; pressedConnection = null; };
         Closed += (_, _) =>
         {
             timer.Stop(); tray.Dispose(); trayIcon.Dispose();
@@ -151,26 +181,124 @@ internal sealed class PanelWindow : Window
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
     }
 
+    private ContextMenu CreatePanelMenu()
+    {
+        var menu = new ContextMenu();
+        menu.Opened += (_, _) =>
+        {
+            openMenus++;
+            // The popup has its own native window; keep it above the topmost panel.
+            if (PresentationSource.FromVisual(menu) is HwndSource popup)
+                Native.SetWindowPos(popup.Handle, new IntPtr(-1), 0, 0, 0, 0, 0x0013);
+        };
+        menu.Closed += (_, _) => { openMenus = Math.Max(0, openMenus - 1); };
+        return menu;
+    }
+
     private void ActivateConnection(IntPtr target)
     {
         if (!Native.IsWindow(target)) return;
         if (Native.IsIconic(target)) Native.ShowWindowAsync(target, 9);
-        Native.SetForegroundWindow(target);
+        if (Native.SetForegroundWindow(target) && preferences.MinimizeOtherRdpOnSwitch)
+            MinimizeConnections(target);
         Refresh();
     }
 
-    private void MinimizeConnections()
+    private void ShowSettings()
+    {
+        if (settingsWindow != null) { settingsWindow.Activate(); return; }
+        var dialog = new Window
+        {
+            Title = "Настройки RdpSwitch", Width = 440, SizeToContent = SizeToContent.Height,
+            ResizeMode = ResizeMode.NoResize, WindowStartupLocation = WindowStartupLocation.CenterScreen,
+            Topmost = true, ShowInTaskbar = false, Background = new SolidColorBrush(Color.FromRgb(29, 32, 39)),
+            Foreground = Brushes.White
+        };
+        var content = new StackPanel { Margin = new Thickness(20) };
+        var option = new CheckBox
+        {
+            Content = new TextBlock { Text = "При переключении на RDP сворачивать остальные RDP", TextWrapping = TextWrapping.Wrap },
+            IsChecked = preferences.MinimizeOtherRdpOnSwitch, Foreground = Brushes.White,
+            Margin = new Thickness(0, 0, 0, 12)
+        };
+        content.Children.Add(option);
+        content.Children.Add(new TextBlock
+        {
+            Text = "Применяется при выборе подключения на панели. Другие приложения не затрагиваются.",
+            TextWrapping = TextWrapping.Wrap, Foreground = Brushes.LightGray, Margin = new Thickness(0, 0, 0, 20)
+        });
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+        var save = new Button { Content = "Сохранить", IsDefault = true, Padding = new Thickness(14, 6, 14, 6) };
+        var cancel = new Button { Content = "Отмена", Padding = new Thickness(14, 6, 14, 6), Margin = new Thickness(8, 0, 0, 0) };
+        save.Click += (_, _) =>
+        {
+            var updated = new Preferences { MinimizeOtherRdpOnSwitch = option.IsChecked == true };
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(settings)!);
+                File.WriteAllText(Path.Combine(Path.GetDirectoryName(settings)!, "settings.json"), JsonSerializer.Serialize(updated));
+                preferences = updated;
+                dialog.Close();
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            { MessageBox.Show(dialog, "Не удалось сохранить настройки: " + e.Message, "RdpSwitch"); }
+        };
+        cancel.Click += (_, _) => dialog.Close();
+        dialog.PreviewKeyDown += (_, e) => { if (e.Key == Key.Escape) dialog.Close(); };
+        buttons.Children.Add(save); buttons.Children.Add(cancel); content.Children.Add(buttons);
+        dialog.Content = content;
+        settingsWindow = dialog;
+        dialog.Closed += (_, _) => { settingsWindow = null; prompting = false; Refresh(); };
+        prompting = true;
+        dialog.Show();
+        dialog.Activate();
+    }
+
+    private void SaveConnections()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(settings)!);
+            File.WriteAllText(Path.Combine(Path.GetDirectoryName(settings)!, "connections.json"), JsonSerializer.Serialize(connections));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+    }
+
+    private void OpenConnection(Connection connection)
+    {
+        Refresh();
+        if (Native.IsWindow(connection.Handle)) { ActivateConnection(connection.Handle); return; }
+        prompting = true;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(connection.Target)) return;
+            var start = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "mstsc.exe")) { UseShellExecute = false };
+            start.ArgumentList.Add("/v:" + connection.Target);
+            Process.Start(start)?.Dispose();
+        }
+        catch (Exception e) when (e is System.ComponentModel.Win32Exception or InvalidOperationException)
+        { MessageBox.Show("Не удалось запустить RDP: " + e.Message, "RdpSwitch"); }
+        finally { prompting = false; Refresh(); }
+    }
+
+    private static string ConnectionTarget(string title)
+    {
+        var parts = Regex.Split(title, @"\s+[—–-]\s+");
+        return parts[^1].Trim();
+    }
+
+    private void MinimizeConnections(IntPtr except = default)
     {
         Refresh();
         foreach (var target in windowOrder.ToArray())
         {
-            if (!Native.IsWindow(target) || Native.IsIconic(target)) continue;
+            if (target == except || !Native.IsWindow(target) || Native.IsIconic(target)) continue;
             Native.GetWindowThreadProcessId(target, out var pid);
             try
             {
                 using var process = Process.GetProcessById((int)pid);
                 if (process.ProcessName.Equals("mstsc", StringComparison.OrdinalIgnoreCase))
-                    Native.ShowWindowAsync(target, 6); // SW_MINIMIZE
+                    Native.ShowWindowAsync(target, 7); // SW_SHOWMINNOACTIVE: preserve the selected window's focus.
             }
             catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { }
         }
@@ -205,7 +333,7 @@ internal sealed class PanelWindow : Window
 
     private void Refresh()
     {
-        if (dragStart != null) return;
+        if (dragStart != null || prompting || openMenus > 0) return;
         var windows = new List<(IntPtr Handle, string Name)>();
         Native.EnumWindows((h, _) =>
         {
@@ -228,26 +356,71 @@ internal sealed class PanelWindow : Window
         foreach (var window in windows)
             if (!windowOrder.Contains(window.Handle)) windowOrder.Add(window.Handle);
         windows.Sort((a, b) => windowOrder.IndexOf(a.Handle).CompareTo(windowOrder.IndexOf(b.Handle)));
+        var changed = false;
+        foreach (var connection in connections)
+            if (!windows.Exists(w => w.Handle == connection.Handle)) connection.Handle = IntPtr.Zero;
+        foreach (var window in windows)
+        {
+            var target = ConnectionTarget(window.Name);
+            var connection = connections.Find(c => c.Handle == window.Handle)
+                ?? connections.Find(c => c.Handle == IntPtr.Zero && c.Target.Equals(target, StringComparison.OrdinalIgnoreCase));
+            if (connection == null)
+            {
+                connection = new Connection { Name = ConnectionLabel(window.Name, connections.Count + 1), Target = target };
+                connections.Add(connection); changed = true;
+            }
+            connection.Handle = window.Handle;
+        }
+        if (changed) SaveConnections();
         var active = Native.GetForegroundWindow();
-        var next = string.Join("|", windows.ConvertAll(w => $"{w.Handle}:{w.Name}:{w.Handle == active}"));
-        if (windows.Count == 0) { Hide(); signature = ""; return; }
+        var next = string.Join("|", connections.ConvertAll(c => $"{c.Handle}:{c.Name}:{c.Handle == active}"));
+        if (connections.Count == 0) { Hide(); signature = ""; return; }
         if (!IsVisible) Show();
         Native.SetWindowPos(handle, new IntPtr(-1), 0, 0, 0, 0, 0x0013);
         if (signature == next) return;
         signature = next; row.Children.Clear();
-        foreach (var window in windows)
+        foreach (var connection in connections)
         {
+            var closed = connection.Handle == IntPtr.Zero;
             var button = new Button
             {
-                Tag = window.Handle,
-                Content = ConnectionLabel(window.Name, windowOrder.IndexOf(window.Handle) + 1), ToolTip = window.Name + "\nНажмите для переключения. Потяните для перемещения панели.",
-                Foreground = Brushes.White, Background = new SolidColorBrush(window.Handle == active ? Color.FromRgb(48, 104, 170) : Color.FromRgb(43, 47, 57)),
+                Tag = connection,
+                Content = connection.Name, ToolTip = connection.Target + (closed ? "\nЗакрыто. Правый клик → Подключиться." : "\nНажмите для переключения. Потяните для перемещения панели."),
+                Foreground = closed ? Brushes.Gray : Brushes.White, Background = new SolidColorBrush(closed ? Color.FromRgb(35, 37, 42) : connection.Handle == active ? Color.FromRgb(48, 104, 170) : Color.FromRgb(43, 47, 57)),
                 BorderThickness = new Thickness(0), Padding = new Thickness(12, 5, 12, 5), Margin = new Thickness(2, 0, 2, 0), FontSize = 12, Focusable = false
             };
             button.Click += (_, _) =>
             {
-                ActivateConnection(window.Handle);
+                ActivateConnection(connection.Handle);
             };
+            if (closed)
+            {
+                var connectionMenu = CreatePanelMenu();
+                var connect = new MenuItem { Header = "Подключиться" };
+                connect.Click += (_, _) => OpenConnection(connection);
+                connectionMenu.Items.Add(connect);
+                button.ContextMenu = connectionMenu;
+            }
+            else
+            {
+                var connectionMenu = CreatePanelMenu();
+                var minimize = new MenuItem { Header = "Свернуть" };
+                minimize.Click += (_, _) =>
+                {
+                    var target = connection.Handle;
+                    if (!Native.IsWindow(target)) return;
+                    Native.GetWindowThreadProcessId(target, out var pid);
+                    try
+                    {
+                        using var process = Process.GetProcessById((int)pid);
+                        if (process.ProcessName.Equals("mstsc", StringComparison.OrdinalIgnoreCase))
+                            Native.ShowWindowAsync(target, 7);
+                    }
+                    catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { }
+                };
+                connectionMenu.Items.Add(minimize);
+                button.ContextMenu = connectionMenu;
+            }
             row.Children.Add(button);
         }
     }
